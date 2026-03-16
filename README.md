@@ -2,7 +2,7 @@
 
 A Solidity testing library for [Reactive Network](https://reactive.network) contracts. Test your reactive contracts locally with `forge test` — no testnet deployment required.
 
-This library simulates the full Reactive Network lifecycle (event subscriptions, `react()` invocations, cross-chain callbacks, and cron triggers) entirely within Foundry's testing framework.
+This library simulates the full Reactive Network lifecycle (event subscriptions, `react()` invocations, cross-chain callbacks, same-chain self-callbacks, cron triggers, and multi-step reactive protocols) entirely within Foundry's testing framework.
 
 ## Installation
 
@@ -40,8 +40,9 @@ contract MyTest is ReactiveTest {
 
 Calling `super.setUp()` automatically:
 - Deploys `MockSystemContract` and etches it to `SERVICE_ADDR` (`0x...fffFfF`)
-- Deploys `MockCallbackProxy` for callback execution
+- Deploys `MockCallbackProxy` for cross-chain callback execution
 - Sets `rvmId` to `address(this)` (the simulated deployer identity)
+- Sets `reactiveChainId` to `REACTIVE_CHAIN_ID` (`0x512512`)
 
 Your reactive contracts can then call `subscribe()` / `unsubscribe()` in their constructors as they would on a real deployment.
 
@@ -66,6 +67,11 @@ function setUp() public override {
         TOPIC_0,             // event signature hash
         address(callback)    // callback target
     );
+
+    // Optional: register contracts for auto chain ID detection
+    registerChain(address(origin), ORIGIN_CHAIN_ID);
+    registerChain(address(callback), DEST_CHAIN_ID);
+    registerChain(address(reactive), reactiveChainId);
 }
 ```
 
@@ -73,17 +79,29 @@ function setUp() public override {
 
 ```solidity
 function testCallbackFires() public {
-    // Trigger an event and run the full reactive cycle
+    // Single-step: trigger an event and run one reactive cycle
     CallbackResult[] memory results = triggerAndReact(
         address(origin),
         abi.encodeWithSignature("doSomething()"),
         ORIGIN_CHAIN_ID
     );
 
-    // Assert on results
     assertCallbackCount(results, 1);
     assertCallbackSuccess(results, 0);
     assertCallbackEmitted(results, address(callback));
+}
+
+function testMultiStepProtocol() public {
+    // Full-cycle: keep processing events until quiescence
+    CallbackResult[] memory results = triggerFullCycle(
+        address(origin),
+        abi.encodeWithSignature("doSomething()"),
+        ORIGIN_CHAIN_ID,
+        20  // max iterations (safety limit)
+    );
+
+    // All callbacks across all reactive hops are collected
+    assertGt(results.length, 1);
 }
 ```
 
@@ -97,7 +115,7 @@ The library replaces the three Reactive Network runtime components:
 | ReactVM | `ReactiveSimulator` | Event delivery and `react()` invocation |
 | Callback Proxy | `MockCallbackProxy` | Cross-chain callback execution |
 
-### Data Flow
+### Data Flow (single-step)
 
 ```
 1. Test calls origin contract            (normal Solidity call)
@@ -106,7 +124,18 @@ The library replaces the three Reactive Network runtime components:
 4. For each match: builds LogRecord, calls rc.react(logRecord)
 5. Simulator captures Callback events from react()
 6. Simulator injects RVM ID into callback payload
-7. Simulator executes callback on destination contract via MockCallbackProxy
+7. Cross-chain callbacks → executed via MockCallbackProxy
+   Same-chain callbacks  → executed via vm.prank(SERVICE_ADDR)
+```
+
+### Data Flow (full-cycle)
+
+```
+1-7. Same as single-step
+8. Events emitted during callback execution are captured
+9. Each event is tagged with the callback's destination chain ID
+10. Events are fed back to step 3 for the next iteration
+11. Repeats until no callbacks are produced or maxIterations is reached
 ```
 
 ## API Reference
@@ -115,39 +144,72 @@ The library replaces the three Reactive Network runtime components:
 
 Inherit this in your test files. Provides:
 
-#### Setup
+#### State
 
 | Member | Type | Description |
 |---|---|---|
 | `sys` | `MockSystemContract` | System contract at `SERVICE_ADDR` |
-| `proxy` | `MockCallbackProxy` | Callback proxy for executing callbacks |
+| `proxy` | `MockCallbackProxy` | Callback proxy for executing cross-chain callbacks |
 | `rvmId` | `address` | Simulated deployer/RVM identity (default: `address(this)`) |
+| `reactiveChainId` | `uint256` | Reactive chain ID for self-callback detection (default: `0x512512`) |
 
-#### Trigger Methods
+#### Chain Registry
+
+Register contracts with their logical chain IDs for auto chain ID detection. This eliminates the need to pass `originChainId` manually on every trigger call.
 
 ```solidity
-// Trigger event + full reactive cycle (no ETH)
-function triggerAndReact(
-    address origin,
-    bytes memory callData,
-    uint256 originChainId
-) internal returns (CallbackResult[] memory);
+// Register a contract as belonging to a specific chain
+registerChain(address(myContract), SEPOLIA);
 
-// Trigger event + full reactive cycle (with ETH)
-function triggerAndReactWithValue(
-    address origin,
-    bytes memory callData,
-    uint256 value,
-    uint256 originChainId
-) internal returns (CallbackResult[] memory);
+// Look up chain ID (returns fallback if not registered)
+uint256 chainId = resolveChainId(address(myContract), fallbackId);
+```
 
-// Trigger a cron event
-function triggerCron(CronType cronType)
+#### Single-Step Trigger Methods
+
+Run one reactive cycle: origin event → `react()` → callbacks.
+
+```solidity
+// With explicit chain ID
+function triggerAndReact(address origin, bytes memory callData, uint256 originChainId)
     internal returns (CallbackResult[] memory);
 
-// Advance N blocks, then trigger cron
-function advanceAndTriggerCron(uint256 blocks, CronType cronType)
+function triggerAndReactWithValue(address origin, bytes memory callData, uint256 value, uint256 originChainId)
     internal returns (CallbackResult[] memory);
+
+// With auto chain ID detection (requires registerChain)
+function triggerAndReact(address origin, bytes memory callData)
+    internal returns (CallbackResult[] memory);
+
+function triggerAndReactWithValue(address origin, bytes memory callData, uint256 value)
+    internal returns (CallbackResult[] memory);
+```
+
+#### Full-Cycle Trigger Methods
+
+Run the complete multi-step reactive cycle until no more callbacks are produced. Callback execution produces new events, which are matched against subscriptions, triggering further `react()` calls — repeating until quiescence or `maxIterations`.
+
+```solidity
+// With explicit chain ID
+function triggerFullCycle(address origin, bytes memory callData, uint256 originChainId, uint256 maxIterations)
+    internal returns (CallbackResult[] memory);
+
+function triggerFullCycleWithValue(address origin, bytes memory callData, uint256 value, uint256 originChainId, uint256 maxIterations)
+    internal returns (CallbackResult[] memory);
+
+// With auto chain ID detection (requires registerChain)
+function triggerFullCycle(address origin, bytes memory callData, uint256 maxIterations)
+    internal returns (CallbackResult[] memory);
+
+function triggerFullCycleWithValue(address origin, bytes memory callData, uint256 value, uint256 maxIterations)
+    internal returns (CallbackResult[] memory);
+```
+
+#### Cron Methods
+
+```solidity
+function triggerCron(CronType cronType) internal returns (CallbackResult[] memory);
+function advanceAndTriggerCron(uint256 blocks, CronType cronType) internal returns (CallbackResult[] memory);
 ```
 
 #### Assertion Helpers
@@ -215,13 +277,15 @@ contract BasicReactiveTest is ReactiveTest {
         origin = new MyOrigin();
         cb = new MyCallback(address(proxy));
         rc = new MyReactive(address(sys), SEPOLIA, address(origin), address(cb));
+
+        registerChain(address(origin), SEPOLIA);
     }
 
     function testReactionTriggered() public {
+        // Auto chain ID detection — no need to pass SEPOLIA
         CallbackResult[] memory results = triggerAndReact(
             address(origin),
-            abi.encodeWithSignature("emitEvent()"),
-            SEPOLIA
+            abi.encodeWithSignature("emitEvent()")
         );
 
         assertCallbackCount(results, 1);
@@ -233,7 +297,7 @@ contract BasicReactiveTest is ReactiveTest {
         vm.etch(unrelated, address(origin).code);
 
         CallbackResult[] memory results = triggerAndReact(
-            unrelated,      // different contract address
+            unrelated,
             abi.encodeWithSignature("emitEvent()"),
             SEPOLIA
         );
@@ -244,8 +308,7 @@ contract BasicReactiveTest is ReactiveTest {
     function testRvmIdInjection() public {
         triggerAndReact(
             address(origin),
-            abi.encodeWithSignature("emitEvent()"),
-            SEPOLIA
+            abi.encodeWithSignature("emitEvent()")
         );
 
         // First argument of the callback payload is overwritten with rvmId
@@ -284,18 +347,80 @@ contract CronTest is ReactiveTest {
 }
 ```
 
-### Passing Callback Sender for `authorizedSenderOnly`
+### Multi-Step Reactive Protocol (e.g. Bridge)
 
-`AbstractCallback` authorizes `_callback_sender` in its constructor. Pass `address(proxy)` so the mock proxy satisfies the modifier:
+For protocols that require multiple reactive cycles — like a bridge with confirmation rounds — use `triggerFullCycle`. Events emitted during callback execution are automatically captured, matched against subscriptions, and fed back through `react()`.
 
 ```solidity
-// In setUp():
+contract BridgeTest is ReactiveTest {
+    Bridge bridge;
+    ReactiveBridge reactiveBridge;
+
+    uint256 constant SEPOLIA = 11155111;
+
+    function setUp() public override {
+        super.setUp();
+
+        bridge = new Bridge(address(proxy), /* ... */);
+        reactiveBridge = new ReactiveBridge(
+            reactiveChainId, SEPOLIA, address(bridge), /* ... */
+        );
+        enableVmMode(address(reactiveBridge));
+
+        // Register for auto chain ID detection
+        registerChain(address(bridge), SEPOLIA);
+        registerChain(address(reactiveBridge), reactiveChainId);
+    }
+
+    function testFullBridgeFlow() public {
+        // Full-cycle runs the entire multi-hop protocol:
+        //   bridge() → SendMessage → react() → Callback to Bridge
+        //   → ConfirmationRequest → react() → Callback to Bridge
+        //   → Confirmation → react() → ... until delivered
+        CallbackResult[] memory results = triggerFullCycleWithValue(
+            address(reactiveBridge),
+            abi.encodeWithSignature("bridge(uint256,address)", 123, recipient),
+            1 ether,
+            20  // max iterations
+        );
+
+        // Verify all callbacks succeeded
+        for (uint256 i = 0; i < results.length; i++) {
+            assertCallbackSuccess(results, i);
+        }
+    }
+}
+```
+
+### Self-Callbacks (Same-Chain Reactive Callbacks)
+
+When a reactive contract emits `Callback(reactiveChainId, address(this), ...)`, the callback targets the same chain. These are delivered via `vm.prank(SERVICE_ADDR)` — matching the real network where RVM-to-RN callbacks come from `SERVICE_ADDR`, not the callback proxy.
+
+This is critical for contracts like `ReactiveBridge` that use `AbstractCallback(address(SERVICE_ADDR))` and have entry points guarded by `authorizedSenderOnly`.
+
+```solidity
+// In react():
+emit Callback(reactiveChainId, address(this), GAS_LIMIT, payload);
+// → Simulator detects chainId == reactiveChainId
+// → Delivers via vm.prank(SERVICE_ADDR) instead of proxy
+// → authorizedSenderOnly passes because msg.sender == SERVICE_ADDR
+```
+
+No special test setup needed — the simulator handles this automatically based on `reactiveChainId`.
+
+### Passing Callback Sender for `authorizedSenderOnly`
+
+For **cross-chain** callbacks, `AbstractCallback` authorizes `_callback_sender` in its constructor. Pass `address(proxy)` so the mock proxy satisfies the modifier:
+
+```solidity
 myCallback = new MyCallbackContract(address(proxy));
 ```
 
+For **same-chain** callbacks (reactive contracts that use `AbstractCallback(address(SERVICE_ADDR))`), the simulator delivers via `SERVICE_ADDR` automatically.
+
 ### Passing RVM ID for `rvmIdOnly`
 
-`AbstractCallback` stores `msg.sender` as `rvm_id`. The proxy overwrites the first callback argument with `rvmId`. Override `rvmId` in your test if needed:
+`AbstractCallback` stores `msg.sender` as `rvm_id`. Both the proxy (cross-chain) and the simulator (same-chain) inject `rvmId` into the first callback argument. Override `rvmId` in your test if needed:
 
 ```solidity
 function testWithCustomDeployer() public {
@@ -356,13 +481,39 @@ contract MyCustomTest is Test {
 
 Everything runs on a single EVM instance. Chain IDs are purely logical values stamped on `LogRecord.chain_id` and `Callback.chain_id`. There is no actual cross-chain communication.
 
+### Callback Routing
+
+The simulator routes callbacks based on the `Callback` event's `chain_id`:
+
+- **Cross-chain** (`chain_id != reactiveChainId`): Executed via `MockCallbackProxy`, which injects RVM ID and calls the target. This simulates the real callback proxy on destination chains.
+- **Same-chain** (`chain_id == reactiveChainId`): Executed via `vm.prank(SERVICE_ADDR)` with RVM ID injection. This simulates how RVM-to-RN callbacks are delivered by `SERVICE_ADDR` on the Reactive Network.
+
+### Multi-Step Cycle
+
+`simulateFullCycle` orchestrates multi-hop protocols:
+
+1. Execute initial call, capture events
+2. Match events against subscriptions, call `react()`, collect `Callback` specs
+3. Execute each callback while recording events emitted by the target
+4. Tag new events with the callback's `chain_id` (events from a Sepolia callback are Sepolia events)
+5. Feed events back to step 2
+6. Stop when no callbacks are produced or `maxIterations` is reached
+
+This handles complex protocols like bridges where a single user action triggers a chain of reactive cycles across multiple logical chains.
+
+### Chain Registry
+
+The chain registry maps contract addresses to logical chain IDs. When using auto-detect trigger methods, the simulator looks up the origin's chain ID from the registry instead of requiring it as a parameter.
+
+In full-cycle mode, events captured during callback execution are automatically tagged with the correct chain ID (the callback's destination chain), so the registry is mainly useful for the initial trigger.
+
 ### `vmOnly` / `rnOnly` Modifiers
 
 `AbstractReactive.detectVm()` checks `extcodesize(SERVICE_ADDR)`. Since we etch mock code to that address, `detectVm()` sets `vm = false` (thinks it's on Reactive Network). This allows `subscribe()` to work in constructors. If your `react()` function uses `vmOnly`, call `enableVmMode(address(rc))` after deployment to flip the flag.
 
 ### RVM ID Injection
 
-The real Reactive Network overwrites the first 20 bytes of the first callback argument with the deployer's address. `MockCallbackProxy` replicates this behavior, so `rvmIdOnly` modifiers work correctly in tests.
+The real Reactive Network overwrites the first 20 bytes of the first callback argument with the deployer's address. Both `MockCallbackProxy` (cross-chain) and the simulator's direct delivery (same-chain) replicate this behavior, so `rvmIdOnly` modifiers work correctly in tests.
 
 ### Subscription Matching
 
