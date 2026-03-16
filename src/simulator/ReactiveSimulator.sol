@@ -16,10 +16,33 @@ struct SimulationParams {
     uint256 reactiveChainId;
 }
 
+/// @notice A pending event awaiting subscription matching, tagged with its origin chain ID.
+struct PendingEvent {
+    uint256 chainId;
+    address emitter;
+    uint256 t0;
+    uint256 t1;
+    uint256 t2;
+    uint256 t3;
+    bytes data;
+}
+
+/// @notice Parsed Callback event (not yet executed).
+struct CallbackSpec {
+    uint256 chainId;
+    address target;
+    uint64 gasLimit;
+    bytes payload;
+}
+
 /// @title ReactiveSimulator
 /// @notice Orchestrates the full reactive lifecycle (event -> react() -> callback) in a Foundry test.
 library ReactiveSimulator {
-    /// @notice Simulate the full event -> react() -> callback cycle.
+    uint256 internal constant DEFAULT_MAX_ITERATIONS = 20;
+
+    // ---- Single-step simulation (original API) ----
+
+    /// @notice Simulate a single event -> react() -> callback cycle.
     function simulateReaction(
         Vm _vm,
         address origin,
@@ -33,14 +56,75 @@ library ReactiveSimulator {
     ) internal returns (CallbackResult[] memory) {
         SimulationParams memory p = SimulationParams(_vm, sys, proxy, rvmId, reactiveChainId);
 
-        // Record logs and execute the triggering call
         _vm.recordLogs();
         (bool ok,) = origin.call{value: value}(callData);
         require(ok, "ReactiveSimulator: origin call failed");
         Vm.Log[] memory logs = _vm.getRecordedLogs();
 
-        return _processLogs(p, logs, originChainId);
+        PendingEvent[] memory pending = _vmLogsToPending(logs, originChainId);
+        // Single-step: process events, execute callbacks, don't capture further events
+        return _processAndExecute(p, pending);
     }
+
+    // ---- Full-cycle simulation (multi-step) ----
+
+    /// @notice Simulate the full multi-step reactive cycle until quiescence.
+    ///         Keeps processing: events -> react() -> callbacks -> new events -> ...
+    ///         Stops when no callbacks are produced or maxIterations is reached.
+    function simulateFullCycle(
+        Vm _vm,
+        address origin,
+        bytes memory callData,
+        uint256 value,
+        uint256 originChainId,
+        MockSystemContract sys,
+        MockCallbackProxy proxy,
+        address rvmId,
+        uint256 reactiveChainId,
+        uint256 maxIterations
+    ) internal returns (CallbackResult[] memory) {
+        SimulationParams memory p = SimulationParams(_vm, sys, proxy, rvmId, reactiveChainId);
+
+        // Execute initial call and capture events
+        _vm.recordLogs();
+        (bool ok,) = origin.call{value: value}(callData);
+        require(ok, "ReactiveSimulator: origin call failed");
+        Vm.Log[] memory logs = _vm.getRecordedLogs();
+
+        PendingEvent[] memory pending = _vmLogsToPending(logs, originChainId);
+
+        CallbackResult[] memory allResults = new CallbackResult[](0);
+
+        for (uint256 iter = 0; iter < maxIterations; iter++) {
+            if (pending.length == 0) break;
+
+            // 1. Match pending events → call react() → collect CallbackSpecs (not yet executed)
+            CallbackSpec[] memory specs = _matchAndReact(p, pending);
+
+            if (specs.length == 0) break;
+
+            // 2. Execute each callback, capturing events emitted by the target
+            CallbackResult[] memory batchResults = new CallbackResult[](specs.length);
+            PendingEvent[] memory tempPending = new PendingEvent[](specs.length * 8);
+            uint256 pendingCount = 0;
+
+            for (uint256 i = 0; i < specs.length; i++) {
+                (CallbackResult memory result, PendingEvent[] memory newEvents) =
+                    _executeCallbackWithCapture(p, specs[i]);
+                batchResults[i] = result;
+                for (uint256 j = 0; j < newEvents.length; j++) {
+                    tempPending[pendingCount++] = newEvents[j];
+                }
+            }
+
+            allResults = _concatResults(allResults, batchResults);
+            pending = _trimPending(tempPending, pendingCount);
+        }
+
+        return allResults;
+    }
+
+    // ---- Event delivery (for cron and manual use) ----
 
     /// @notice Deliver a specific LogRecord to all matching subscribers and execute callbacks.
     function deliverEvent(
@@ -53,22 +137,18 @@ library ReactiveSimulator {
     ) internal returns (CallbackResult[] memory) {
         SimulationParams memory p = SimulationParams(_vm, sys, proxy, rvmId, reactiveChainId);
 
-        address[] memory subscribers = sys.getMatchingSubscribers(
-            log.chain_id, log._contract,
-            log.topic_0, log.topic_1, log.topic_2, log.topic_3
-        );
+        PendingEvent[] memory pending = new PendingEvent[](1);
+        pending[0] = PendingEvent({
+            chainId: log.chain_id,
+            emitter: log._contract,
+            t0: log.topic_0,
+            t1: log.topic_1,
+            t2: log.topic_2,
+            t3: log.topic_3,
+            data: log.data
+        });
 
-        CallbackResult[] memory tempResults = new CallbackResult[](subscribers.length * 4);
-        uint256 resultCount = 0;
-
-        for (uint256 i = 0; i < subscribers.length; i++) {
-            CallbackResult[] memory cbResults = _deliverAndCapture(p, subscribers[i], log);
-            for (uint256 j = 0; j < cbResults.length; j++) {
-                tempResults[resultCount++] = cbResults[j];
-            }
-        }
-
-        return _trimResults(tempResults, resultCount);
+        return _processAndExecute(p, pending);
     }
 
     /// @notice Manually deliver a LogRecord to a specific reactive contract (no callback processing).
@@ -81,71 +161,198 @@ library ReactiveSimulator {
         target.react(log);
     }
 
-    // ---- Internal helpers ----
+    // ---- Internal: single-step processing (match → react → execute callbacks) ----
 
-    function _processLogs(
+    /// @dev Process pending events: match → react() → execute callbacks. No event capture from callbacks.
+    function _processAndExecute(
         SimulationParams memory p,
-        Vm.Log[] memory logs,
-        uint256 originChainId
+        PendingEvent[] memory pending
     ) private returns (CallbackResult[] memory) {
-        CallbackResult[] memory tempResults = new CallbackResult[](logs.length * 4);
-        uint256 resultCount = 0;
+        // Collect callback specs from react() calls
+        CallbackSpec[] memory specs = _matchAndReact(p, pending);
 
-        for (uint256 i = 0; i < logs.length; i++) {
-            uint256 rc = _processOneLog(p, logs[i], originChainId, tempResults, resultCount);
-            resultCount = rc;
+        // Execute all callbacks
+        CallbackResult[] memory results = new CallbackResult[](specs.length);
+        for (uint256 i = 0; i < specs.length; i++) {
+            results[i] = _executeCallback(p, specs[i]);
         }
-
-        return _trimResults(tempResults, resultCount);
+        return results;
     }
 
-    function _processOneLog(
+    // ---- Internal: match events → react() → collect CallbackSpecs ----
+
+    /// @dev For each pending event, find matching subscribers, call react(), collect Callback events.
+    function _matchAndReact(
         SimulationParams memory p,
-        Vm.Log memory entry,
-        uint256 originChainId,
-        CallbackResult[] memory tempResults,
-        uint256 resultCount
-    ) private returns (uint256) {
-        // Extract topics
-        uint256 t0 = entry.topics.length > 0 ? uint256(entry.topics[0]) : 0;
-        uint256 t1 = entry.topics.length > 1 ? uint256(entry.topics[1]) : 0;
-        uint256 t2 = entry.topics.length > 2 ? uint256(entry.topics[2]) : 0;
-        uint256 t3 = entry.topics.length > 3 ? uint256(entry.topics[3]) : 0;
+        PendingEvent[] memory pending
+    ) private returns (CallbackSpec[] memory) {
+        CallbackSpec[] memory tempSpecs = new CallbackSpec[](pending.length * 8);
+        uint256 specCount = 0;
 
-        address[] memory subscribers = p.sys.getMatchingSubscribers(
-            originChainId, entry.emitter, t0, t1, t2, t3
-        );
+        for (uint256 i = 0; i < pending.length; i++) {
+            address[] memory subscribers = p.sys.getMatchingSubscribers(
+                pending[i].chainId, pending[i].emitter,
+                pending[i].t0, pending[i].t1, pending[i].t2, pending[i].t3
+            );
 
-        if (subscribers.length == 0) return resultCount;
+            if (subscribers.length == 0) continue;
 
-        LogRecord memory log = _buildLogRecord(entry, originChainId, t0, t1, t2, t3);
+            LogRecord memory log = _pendingToLogRecord(pending[i]);
 
-        for (uint256 j = 0; j < subscribers.length; j++) {
-            CallbackResult[] memory cbResults = _deliverAndCapture(p, subscribers[j], log);
-            for (uint256 k = 0; k < cbResults.length; k++) {
-                tempResults[resultCount++] = cbResults[k];
+            for (uint256 j = 0; j < subscribers.length; j++) {
+                CallbackSpec[] memory specs = _reactAndExtractSpecs(p, subscribers[j], log);
+                for (uint256 k = 0; k < specs.length; k++) {
+                    tempSpecs[specCount++] = specs[k];
+                }
             }
         }
 
-        return resultCount;
+        return _trimSpecs(tempSpecs, specCount);
     }
 
-    function _buildLogRecord(
-        Vm.Log memory entry,
-        uint256 chainId,
-        uint256 t0,
-        uint256 t1,
-        uint256 t2,
-        uint256 t3
-    ) private view returns (LogRecord memory) {
+    /// @dev Call react() on a subscriber and parse emitted Callback events into CallbackSpecs.
+    function _reactAndExtractSpecs(
+        SimulationParams memory p,
+        address subscriber,
+        LogRecord memory log
+    ) private returns (CallbackSpec[] memory) {
+        p._vm.recordLogs();
+        p._vm.prank(address(ReactiveConstants.SERVICE_ADDR));
+        IReactive(subscriber).react(log);
+        Vm.Log[] memory reactLogs = p._vm.getRecordedLogs();
+
+        bytes32 cbTopic = ReactiveConstants.CALLBACK_EVENT_TOPIC;
+
+        uint256 cbCount = 0;
+        for (uint256 i = 0; i < reactLogs.length; i++) {
+            if (reactLogs[i].topics.length >= 4 && reactLogs[i].topics[0] == cbTopic) {
+                cbCount++;
+            }
+        }
+
+        CallbackSpec[] memory specs = new CallbackSpec[](cbCount);
+        uint256 idx = 0;
+
+        for (uint256 i = 0; i < reactLogs.length; i++) {
+            if (reactLogs[i].topics.length < 4 || reactLogs[i].topics[0] != cbTopic) continue;
+
+            specs[idx++] = CallbackSpec({
+                chainId: uint256(reactLogs[i].topics[1]),
+                target: address(uint160(uint256(reactLogs[i].topics[2]))),
+                gasLimit: uint64(uint256(reactLogs[i].topics[3])),
+                payload: abi.decode(reactLogs[i].data, (bytes))
+            });
+        }
+
+        return specs;
+    }
+
+    // ---- Internal: callback execution ----
+
+    /// @dev Execute a callback (no event capture). Used by single-step mode.
+    function _executeCallback(
+        SimulationParams memory p,
+        CallbackSpec memory spec
+    ) private returns (CallbackResult memory) {
+        bool success;
+        bytes memory returnData;
+
+        if (spec.chainId == p.reactiveChainId) {
+            _injectRvmId(spec.payload, p.rvmId);
+            p._vm.prank(address(ReactiveConstants.SERVICE_ADDR));
+            (success, returnData) = spec.target.call{gas: spec.gasLimit}(spec.payload);
+        } else {
+            (success, returnData) = p.proxy.executeCallback(
+                spec.target, spec.payload, spec.gasLimit, p.rvmId
+            );
+        }
+
+        return CallbackResult({
+            chainId: spec.chainId,
+            target: spec.target,
+            gasLimit: spec.gasLimit,
+            payload: spec.payload,
+            success: success,
+            returnData: returnData
+        });
+    }
+
+    /// @dev Execute a callback while recording events emitted by the target. Used by full-cycle mode.
+    ///      Events emitted during execution are tagged with the callback's chain ID.
+    function _executeCallbackWithCapture(
+        SimulationParams memory p,
+        CallbackSpec memory spec
+    ) private returns (CallbackResult memory, PendingEvent[] memory) {
+        bool success;
+        bytes memory returnData;
+
+        p._vm.recordLogs();
+
+        if (spec.chainId == p.reactiveChainId) {
+            _injectRvmId(spec.payload, p.rvmId);
+            p._vm.prank(address(ReactiveConstants.SERVICE_ADDR));
+            (success, returnData) = spec.target.call{gas: spec.gasLimit}(spec.payload);
+        } else {
+            (success, returnData) = p.proxy.executeCallback(
+                spec.target, spec.payload, spec.gasLimit, p.rvmId
+            );
+        }
+
+        Vm.Log[] memory logs = p._vm.getRecordedLogs();
+        PendingEvent[] memory newEvents = _vmLogsToPending(logs, spec.chainId);
+
+        return (
+            CallbackResult({
+                chainId: spec.chainId,
+                target: spec.target,
+                gasLimit: spec.gasLimit,
+                payload: spec.payload,
+                success: success,
+                returnData: returnData
+            }),
+            newEvents
+        );
+    }
+
+    // ---- Internal: helpers ----
+
+    function _injectRvmId(bytes memory payload, address rvmId) private pure {
+        if (payload.length >= 36) {
+            assembly {
+                let argStart := add(add(payload, 0x20), 4)
+                mstore(argStart, rvmId)
+            }
+        }
+    }
+
+    function _vmLogsToPending(
+        Vm.Log[] memory logs,
+        uint256 chainId
+    ) private pure returns (PendingEvent[] memory) {
+        PendingEvent[] memory pending = new PendingEvent[](logs.length);
+        for (uint256 i = 0; i < logs.length; i++) {
+            pending[i] = PendingEvent({
+                chainId: chainId,
+                emitter: logs[i].emitter,
+                t0: logs[i].topics.length > 0 ? uint256(logs[i].topics[0]) : 0,
+                t1: logs[i].topics.length > 1 ? uint256(logs[i].topics[1]) : 0,
+                t2: logs[i].topics.length > 2 ? uint256(logs[i].topics[2]) : 0,
+                t3: logs[i].topics.length > 3 ? uint256(logs[i].topics[3]) : 0,
+                data: logs[i].data
+            });
+        }
+        return pending;
+    }
+
+    function _pendingToLogRecord(PendingEvent memory evt) private view returns (LogRecord memory) {
         return LogRecord({
-            chain_id: chainId,
-            _contract: entry.emitter,
-            topic_0: t0,
-            topic_1: t1,
-            topic_2: t2,
-            topic_3: t3,
-            data: entry.data,
+            chain_id: evt.chainId,
+            _contract: evt.emitter,
+            topic_0: evt.t0,
+            topic_1: evt.t1,
+            topic_2: evt.t2,
+            topic_3: evt.t3,
+            data: evt.data,
             block_number: block.number,
             op_code: 0,
             block_hash: 0,
@@ -154,96 +361,40 @@ library ReactiveSimulator {
         });
     }
 
-    /// @dev Calls react() on a subscriber, captures Callback events, and executes them.
-    function _deliverAndCapture(
-        SimulationParams memory p,
-        address subscriber,
-        LogRecord memory log
-    ) private returns (CallbackResult[] memory) {
-        // Record logs to capture Callback events from react()
-        p._vm.recordLogs();
-        p._vm.prank(address(ReactiveConstants.SERVICE_ADDR));
-        IReactive(subscriber).react(log);
-        Vm.Log[] memory reactLogs = p._vm.getRecordedLogs();
-
-        return _extractCallbacks(p, reactLogs);
-    }
-
-    function _extractCallbacks(
-        SimulationParams memory p,
-        Vm.Log[] memory reactLogs
-    ) private returns (CallbackResult[] memory) {
-        bytes32 cbTopic = ReactiveConstants.CALLBACK_EVENT_TOPIC;
-
-        // Count callback events
-        uint256 cbCount = 0;
-        for (uint256 i = 0; i < reactLogs.length; i++) {
-            if (reactLogs[i].topics.length >= 4 && reactLogs[i].topics[0] == cbTopic) {
-                cbCount++;
-            }
-        }
-
-        CallbackResult[] memory results = new CallbackResult[](cbCount);
-        uint256 idx = 0;
-
-        for (uint256 i = 0; i < reactLogs.length; i++) {
-            if (reactLogs[i].topics.length < 4 || reactLogs[i].topics[0] != cbTopic) continue;
-
-            results[idx++] = _executeOneCallback(p, reactLogs[i]);
-        }
-
-        return results;
-    }
-
-    function _executeOneCallback(
-        SimulationParams memory p,
-        Vm.Log memory logEntry
-    ) private returns (CallbackResult memory) {
-        uint256 chainId = uint256(logEntry.topics[1]);
-        address target = address(uint160(uint256(logEntry.topics[2])));
-        uint64 gasLimit = uint64(uint256(logEntry.topics[3]));
-        bytes memory payload = abi.decode(logEntry.data, (bytes));
-
-        bool success;
-        bytes memory returnData;
-
-        if (chainId == p.reactiveChainId) {
-            // Same-chain callback (reactive contract calling itself or another RN contract).
-            // On the real network, these are delivered by SERVICE_ADDR, not the callback proxy.
-            // Inject RVM ID into payload first argument (same as proxy does).
-            if (payload.length >= 36) {
-                assembly {
-                    let argStart := add(add(payload, 0x20), 4)
-                    mstore(argStart, mload(add(p, 0x60))) // p.rvmId is at offset 0x60 in struct
-                }
-            }
-            p._vm.prank(address(ReactiveConstants.SERVICE_ADDR));
-            (success, returnData) = target.call{gas: gasLimit}(payload);
-        } else {
-            // Cross-chain callback — deliver via the callback proxy.
-            (success, returnData) = p.proxy.executeCallback(
-                target, payload, gasLimit, p.rvmId
-            );
-        }
-
-        return CallbackResult({
-            chainId: chainId,
-            target: target,
-            gasLimit: gasLimit,
-            payload: payload,
-            success: success,
-            returnData: returnData
-        });
-    }
-
     function _trimResults(
-        CallbackResult[] memory tempResults,
+        CallbackResult[] memory temp,
         uint256 count
     ) private pure returns (CallbackResult[] memory) {
-        CallbackResult[] memory results = new CallbackResult[](count);
-        for (uint256 i = 0; i < count; i++) {
-            results[i] = tempResults[i];
-        }
-        return results;
+        CallbackResult[] memory result = new CallbackResult[](count);
+        for (uint256 i = 0; i < count; i++) result[i] = temp[i];
+        return result;
+    }
+
+    function _trimSpecs(
+        CallbackSpec[] memory temp,
+        uint256 count
+    ) private pure returns (CallbackSpec[] memory) {
+        CallbackSpec[] memory result = new CallbackSpec[](count);
+        for (uint256 i = 0; i < count; i++) result[i] = temp[i];
+        return result;
+    }
+
+    function _trimPending(
+        PendingEvent[] memory temp,
+        uint256 count
+    ) private pure returns (PendingEvent[] memory) {
+        PendingEvent[] memory result = new PendingEvent[](count);
+        for (uint256 i = 0; i < count; i++) result[i] = temp[i];
+        return result;
+    }
+
+    function _concatResults(
+        CallbackResult[] memory a,
+        CallbackResult[] memory b
+    ) private pure returns (CallbackResult[] memory) {
+        CallbackResult[] memory result = new CallbackResult[](a.length + b.length);
+        for (uint256 i = 0; i < a.length; i++) result[i] = a[i];
+        for (uint256 i = 0; i < b.length; i++) result[a.length + i] = b[i];
+        return result;
     }
 }

@@ -94,6 +94,35 @@ abstract contract ReactiveTest is Test {
         );
     }
 
+    // ---- Convenience: Full-cycle simulation ----
+
+    /// @notice Trigger an event and run the full multi-step reactive cycle until quiescence.
+    ///         Chains multiple rounds: events → react() → callbacks → new events → ...
+    ///         Stops when no callbacks are produced or maxIterations is reached.
+    function triggerFullCycle(
+        address origin,
+        bytes memory callData,
+        uint256 originChainId,
+        uint256 maxIterations
+    ) internal returns (CallbackResult[] memory results) {
+        return ReactiveSimulator.simulateFullCycle(
+            vm, origin, callData, 0, originChainId, sys, proxy, rvmId, reactiveChainId, maxIterations
+        );
+    }
+
+    /// @notice Full-cycle with ETH value.
+    function triggerFullCycleWithValue(
+        address origin,
+        bytes memory callData,
+        uint256 value,
+        uint256 originChainId,
+        uint256 maxIterations
+    ) internal returns (CallbackResult[] memory results) {
+        return ReactiveSimulator.simulateFullCycle(
+            vm, origin, callData, value, originChainId, sys, proxy, rvmId, reactiveChainId, maxIterations
+        );
+    }
+
     // ---- Convenience: Cron ----
 
     /// @notice Trigger a cron event and deliver to matching subscribers.
