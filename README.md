@@ -7,13 +7,13 @@ This library simulates the full Reactive Network lifecycle (event subscriptions,
 ## Installation
 
 ```bash
-forge install <your-org>/reactive-foundry-test
+forge install Reactive-Network/reactive-test-lib
 ```
 
 Add the remapping to your `remappings.txt` or `foundry.toml`:
 
 ```
-reactive-foundry-test/=lib/reactive-foundry-test/src/
+reactive-test-lib/=lib/reactive-test-lib/src/
 ```
 
 ### Requirements
@@ -27,8 +27,8 @@ reactive-foundry-test/=lib/reactive-foundry-test/src/
 ### 1. Inherit from `ReactiveTest`
 
 ```solidity
-import "reactive-foundry-test/base/ReactiveTest.sol";
-import {CallbackResult} from "reactive-foundry-test/interfaces/IReactiveInterfaces.sol";
+import "reactive-test-lib/base/ReactiveTest.sol";
+import {CallbackResult} from "reactive-test-lib/interfaces/IReactiveInterfaces.sol";
 
 contract MyTest is ReactiveTest {
     function setUp() public override {
@@ -257,8 +257,8 @@ contract BasicReactiveTest is ReactiveTest {
 ### Cron-Driven Reactive Contract
 
 ```solidity
-import {CronType} from "reactive-foundry-test/interfaces/IReactiveInterfaces.sol";
-import {ReactiveConstants} from "reactive-foundry-test/constants/ReactiveConstants.sol";
+import {CronType} from "reactive-test-lib/interfaces/IReactiveInterfaces.sol";
+import {ReactiveConstants} from "reactive-test-lib/constants/ReactiveConstants.sol";
 
 contract CronTest is ReactiveTest {
     MyCronReactive rc;
@@ -311,8 +311,8 @@ function testWithCustomDeployer() public {
 For fine-grained control, use `ReactiveSimulator` and `CronSimulator` libraries directly:
 
 ```solidity
-import {ReactiveSimulator} from "reactive-foundry-test/simulator/ReactiveSimulator.sol";
-import {LogRecord, IReactive} from "reactive-foundry-test/interfaces/IReactiveInterfaces.sol";
+import {ReactiveSimulator} from "reactive-test-lib/simulator/ReactiveSimulator.sol";
+import {LogRecord, IReactive} from "reactive-test-lib/interfaces/IReactiveInterfaces.sol";
 
 // Deliver a hand-crafted LogRecord to a specific reactive contract
 LogRecord memory log = LogRecord({
@@ -338,9 +338,9 @@ ReactiveSimulator.deliverRawEvent(vm, IReactive(address(rc)), log);
 If you prefer composition over inheritance:
 
 ```solidity
-import {ReactiveFixtures} from "reactive-foundry-test/base/ReactiveFixtures.sol";
-import {MockSystemContract} from "reactive-foundry-test/mock/MockSystemContract.sol";
-import {MockCallbackProxy} from "reactive-foundry-test/mock/MockCallbackProxy.sol";
+import {ReactiveFixtures} from "reactive-test-lib/base/ReactiveFixtures.sol";
+import {MockSystemContract} from "reactive-test-lib/mock/MockSystemContract.sol";
+import {MockCallbackProxy} from "reactive-test-lib/mock/MockCallbackProxy.sol";
 
 contract MyCustomTest is Test {
     function setUp() public {
