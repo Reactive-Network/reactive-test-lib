@@ -12,24 +12,18 @@ import {ReactiveSimulator} from "./ReactiveSimulator.sol";
 /// @notice Simulates cron-based event triggers for time-based reactive contracts.
 library CronSimulator {
     /// @notice Emit a synthetic cron event and deliver it to all matching subscribers.
-    /// @param _vm Foundry VM instance.
-    /// @param cronType The cron frequency type to trigger.
-    /// @param sys MockSystemContract for subscription matching.
-    /// @param proxy MockCallbackProxy for callback execution.
-    /// @param rvmId Deployer/RVM identity address.
-    /// @return results Array of callback execution results.
     function triggerCron(
         Vm _vm,
         CronType cronType,
         MockSystemContract sys,
         MockCallbackProxy proxy,
-        address rvmId
+        address rvmId,
+        uint256 reactiveChainId
     ) internal returns (CallbackResult[] memory results) {
         uint256 cronTopic = _getCronTopic(cronType);
 
-        // Construct a synthetic LogRecord mimicking a cron event
         LogRecord memory log = LogRecord({
-            chain_id: ReactiveConstants.REACTIVE_CHAIN_ID,
+            chain_id: reactiveChainId,
             _contract: address(ReactiveConstants.SERVICE_ADDR),
             topic_0: cronTopic,
             topic_1: 0,
@@ -43,28 +37,22 @@ library CronSimulator {
             log_index: 0
         });
 
-        return ReactiveSimulator.deliverEvent(_vm, log, sys, proxy, rvmId);
+        return ReactiveSimulator.deliverEvent(_vm, log, sys, proxy, rvmId, reactiveChainId);
     }
 
     /// @notice Advance block number, then trigger a cron event.
-    /// @param _vm Foundry VM instance.
-    /// @param blocks Number of blocks to advance.
-    /// @param cronType The cron frequency type to trigger.
-    /// @param sys MockSystemContract for subscription matching.
-    /// @param proxy MockCallbackProxy for callback execution.
-    /// @param rvmId Deployer/RVM identity address.
-    /// @return results Array of callback execution results.
     function advanceAndTriggerCron(
         Vm _vm,
         uint256 blocks,
         CronType cronType,
         MockSystemContract sys,
         MockCallbackProxy proxy,
-        address rvmId
+        address rvmId,
+        uint256 reactiveChainId
     ) internal returns (CallbackResult[] memory results) {
         _vm.roll(block.number + blocks);
         _vm.warp(block.timestamp + blocks * 12); // ~12s per block
-        return triggerCron(_vm, cronType, sys, proxy, rvmId);
+        return triggerCron(_vm, cronType, sys, proxy, rvmId, reactiveChainId);
     }
 
     /// @notice Maps CronType enum to the corresponding topic constant.

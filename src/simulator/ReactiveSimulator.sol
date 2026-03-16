@@ -13,6 +13,7 @@ struct SimulationParams {
     MockSystemContract sys;
     MockCallbackProxy proxy;
     address rvmId;
+    uint256 reactiveChainId;
 }
 
 /// @title ReactiveSimulator
@@ -27,9 +28,10 @@ library ReactiveSimulator {
         uint256 originChainId,
         MockSystemContract sys,
         MockCallbackProxy proxy,
-        address rvmId
+        address rvmId,
+        uint256 reactiveChainId
     ) internal returns (CallbackResult[] memory) {
-        SimulationParams memory p = SimulationParams(_vm, sys, proxy, rvmId);
+        SimulationParams memory p = SimulationParams(_vm, sys, proxy, rvmId, reactiveChainId);
 
         // Record logs and execute the triggering call
         _vm.recordLogs();
@@ -46,9 +48,10 @@ library ReactiveSimulator {
         LogRecord memory log,
         MockSystemContract sys,
         MockCallbackProxy proxy,
-        address rvmId
+        address rvmId,
+        uint256 reactiveChainId
     ) internal returns (CallbackResult[] memory) {
-        SimulationParams memory p = SimulationParams(_vm, sys, proxy, rvmId);
+        SimulationParams memory p = SimulationParams(_vm, sys, proxy, rvmId, reactiveChainId);
 
         address[] memory subscribers = sys.getMatchingSubscribers(
             log.chain_id, log._contract,
@@ -201,9 +204,27 @@ library ReactiveSimulator {
         uint64 gasLimit = uint64(uint256(logEntry.topics[3]));
         bytes memory payload = abi.decode(logEntry.data, (bytes));
 
-        (bool success, bytes memory returnData) = p.proxy.executeCallback(
-            target, payload, gasLimit, p.rvmId
-        );
+        bool success;
+        bytes memory returnData;
+
+        if (chainId == p.reactiveChainId) {
+            // Same-chain callback (reactive contract calling itself or another RN contract).
+            // On the real network, these are delivered by SERVICE_ADDR, not the callback proxy.
+            // Inject RVM ID into payload first argument (same as proxy does).
+            if (payload.length >= 36) {
+                assembly {
+                    let argStart := add(add(payload, 0x20), 4)
+                    mstore(argStart, mload(add(p, 0x60))) // p.rvmId is at offset 0x60 in struct
+                }
+            }
+            p._vm.prank(address(ReactiveConstants.SERVICE_ADDR));
+            (success, returnData) = target.call{gas: gasLimit}(payload);
+        } else {
+            // Cross-chain callback — deliver via the callback proxy.
+            (success, returnData) = p.proxy.executeCallback(
+                target, payload, gasLimit, p.rvmId
+            );
+        }
 
         return CallbackResult({
             chainId: chainId,

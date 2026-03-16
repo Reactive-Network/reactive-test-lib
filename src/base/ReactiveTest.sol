@@ -24,6 +24,12 @@ abstract contract ReactiveTest is Test {
     MockCallbackProxy internal proxy;
     address internal rvmId;
 
+    /// @notice The reactive chain ID used to distinguish same-chain callbacks from cross-chain ones.
+    ///         Callbacks targeting this chain ID are delivered via vm.prank(SERVICE_ADDR) instead of
+    ///         through the proxy. Defaults to REACTIVE_CHAIN_ID (0x512512).
+    ///         Override in setUp() if your reactive contract uses a different value.
+    uint256 internal reactiveChainId;
+
     function setUp() public virtual {
         // 1. Deploy MockSystemContract to a regular address
         MockSystemContract sysImpl = new MockSystemContract();
@@ -39,6 +45,9 @@ abstract contract ReactiveTest is Test {
 
         // 4. Set rvmId to the test contract address (simulates the deployer)
         rvmId = address(this);
+
+        // 5. Default reactive chain ID
+        reactiveChainId = ReactiveConstants.REACTIVE_CHAIN_ID;
     }
 
     // ---- Convenience: Enable VM mode on a reactive contract ----
@@ -64,7 +73,7 @@ abstract contract ReactiveTest is Test {
         uint256 originChainId
     ) internal returns (CallbackResult[] memory results) {
         return ReactiveSimulator.simulateReaction(
-            vm, origin, callData, 0, originChainId, sys, proxy, rvmId
+            vm, origin, callData, 0, originChainId, sys, proxy, rvmId, reactiveChainId
         );
     }
 
@@ -81,7 +90,7 @@ abstract contract ReactiveTest is Test {
         uint256 originChainId
     ) internal returns (CallbackResult[] memory results) {
         return ReactiveSimulator.simulateReaction(
-            vm, origin, callData, value, originChainId, sys, proxy, rvmId
+            vm, origin, callData, value, originChainId, sys, proxy, rvmId, reactiveChainId
         );
     }
 
@@ -89,7 +98,7 @@ abstract contract ReactiveTest is Test {
 
     /// @notice Trigger a cron event and deliver to matching subscribers.
     function triggerCron(CronType cronType) internal returns (CallbackResult[] memory) {
-        return CronSimulator.triggerCron(vm, cronType, sys, proxy, rvmId);
+        return CronSimulator.triggerCron(vm, cronType, sys, proxy, rvmId, reactiveChainId);
     }
 
     /// @notice Advance blocks and trigger a cron event.
@@ -97,7 +106,7 @@ abstract contract ReactiveTest is Test {
         internal
         returns (CallbackResult[] memory)
     {
-        return CronSimulator.advanceAndTriggerCron(vm, blocks, cronType, sys, proxy, rvmId);
+        return CronSimulator.advanceAndTriggerCron(vm, blocks, cronType, sys, proxy, rvmId, reactiveChainId);
     }
 
     // ---- Assertion helpers ----
