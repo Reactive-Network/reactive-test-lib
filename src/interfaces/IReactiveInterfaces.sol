@@ -76,3 +76,9 @@ enum CronType {
     Cron1000,
     Cron10000
 }
+
+/// @notice Interface for the chain registry used by the simulator for auto chain ID detection.
+interface IChainRegistry {
+    /// @notice Returns the chain ID for a given contract address, or 0 if not registered.
+    function getChainId(address contractAddr) external view returns (uint256);
+}

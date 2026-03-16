@@ -19,6 +19,7 @@ import {CallbackResult, CronType} from "../interfaces/IReactiveInterfaces.sol";
 ///   2. Call super.setUp() in your setUp()
 ///   3. Deploy your reactive/callback contracts — they will interact with MockSystemContract
 ///   4. Use triggerAndReact() / triggerCron() to simulate the reactive lifecycle
+///   5. Optionally register contracts with registerChain() for auto chain ID detection
 abstract contract ReactiveTest is Test {
     MockSystemContract internal sys;
     MockCallbackProxy internal proxy;
@@ -29,6 +30,13 @@ abstract contract ReactiveTest is Test {
     ///         through the proxy. Defaults to REACTIVE_CHAIN_ID (0x512512).
     ///         Override in setUp() if your reactive contract uses a different value.
     uint256 internal reactiveChainId;
+
+    /// @notice Maps contract addresses to their logical chain IDs.
+    ///         Used by auto-detect overloads to determine the chain ID of event emitters.
+    mapping(address => uint256) internal chainRegistry;
+
+    /// @notice Tracks whether an address has been registered (needed because chain ID 0 is valid as wildcard).
+    mapping(address => bool) internal chainRegistrySet;
 
     function setUp() public virtual {
         // 1. Deploy MockSystemContract to a regular address
@@ -50,6 +58,26 @@ abstract contract ReactiveTest is Test {
         reactiveChainId = ReactiveConstants.REACTIVE_CHAIN_ID;
     }
 
+    // ---- Chain registry ----
+
+    /// @notice Register a contract as belonging to a specific logical chain.
+    ///         Used by auto-detect methods to resolve chain IDs from event emitters.
+    /// @param contractAddr The contract address.
+    /// @param chainId The logical chain ID events from this contract belong to.
+    function registerChain(address contractAddr, uint256 chainId) internal {
+        chainRegistry[contractAddr] = chainId;
+        chainRegistrySet[contractAddr] = true;
+    }
+
+    /// @notice Look up the chain ID for a contract. Returns the registered chain ID,
+    ///         or the fallback if the contract is not registered.
+    function resolveChainId(address contractAddr, uint256 fallback_) internal view returns (uint256) {
+        if (chainRegistrySet[contractAddr]) {
+            return chainRegistry[contractAddr];
+        }
+        return fallback_;
+    }
+
     // ---- Convenience: Enable VM mode on a reactive contract ----
 
     /// @notice Enables VM mode on a reactive contract so vmOnly modifiers pass.
@@ -60,13 +88,9 @@ abstract contract ReactiveTest is Test {
         vm.store(rc, ReactiveConstants.VM_STORAGE_SLOT, bytes32(uint256(1)));
     }
 
-    // ---- Convenience: Trigger and react ----
+    // ---- Convenience: Single-step trigger with explicit chain ID ----
 
-    /// @notice Trigger an event on an origin contract and run the full reactive cycle.
-    /// @param origin The contract to call (emits triggering events).
-    /// @param callData Encoded function call to execute on origin.
-    /// @param originChainId Chain ID to stamp on LogRecords.
-    /// @return results Array of callback execution results.
+    /// @notice Trigger an event on an origin contract and run a single reactive cycle.
     function triggerAndReact(
         address origin,
         bytes memory callData,
@@ -77,12 +101,7 @@ abstract contract ReactiveTest is Test {
         );
     }
 
-    /// @notice Trigger an event with ETH value and run the full reactive cycle.
-    /// @param origin The contract to call.
-    /// @param callData Encoded function call.
-    /// @param value ETH value to send.
-    /// @param originChainId Chain ID to stamp on LogRecords.
-    /// @return results Array of callback execution results.
+    /// @notice Trigger an event with ETH value and run a single reactive cycle.
     function triggerAndReactWithValue(
         address origin,
         bytes memory callData,
@@ -94,11 +113,31 @@ abstract contract ReactiveTest is Test {
         );
     }
 
-    // ---- Convenience: Full-cycle simulation ----
+    // ---- Convenience: Single-step trigger with auto chain ID detection ----
+
+    /// @notice Trigger an event using the chain registry to resolve the origin's chain ID.
+    ///         The origin contract must be registered via registerChain().
+    function triggerAndReact(
+        address origin,
+        bytes memory callData
+    ) internal returns (CallbackResult[] memory results) {
+        require(chainRegistrySet[origin], "ReactiveTest: origin not registered in chain registry");
+        return triggerAndReact(origin, callData, chainRegistry[origin]);
+    }
+
+    /// @notice Trigger an event with ETH value, using the chain registry for chain ID.
+    function triggerAndReactWithValue(
+        address origin,
+        bytes memory callData,
+        uint256 value
+    ) internal returns (CallbackResult[] memory results) {
+        require(chainRegistrySet[origin], "ReactiveTest: origin not registered in chain registry");
+        return triggerAndReactWithValue(origin, callData, value, chainRegistry[origin]);
+    }
+
+    // ---- Convenience: Full-cycle with explicit chain ID ----
 
     /// @notice Trigger an event and run the full multi-step reactive cycle until quiescence.
-    ///         Chains multiple rounds: events → react() → callbacks → new events → ...
-    ///         Stops when no callbacks are produced or maxIterations is reached.
     function triggerFullCycle(
         address origin,
         bytes memory callData,
@@ -121,6 +160,29 @@ abstract contract ReactiveTest is Test {
         return ReactiveSimulator.simulateFullCycle(
             vm, origin, callData, value, originChainId, sys, proxy, rvmId, reactiveChainId, maxIterations
         );
+    }
+
+    // ---- Convenience: Full-cycle with auto chain ID detection ----
+
+    /// @notice Full-cycle using the chain registry for the origin's chain ID.
+    function triggerFullCycle(
+        address origin,
+        bytes memory callData,
+        uint256 maxIterations
+    ) internal returns (CallbackResult[] memory results) {
+        require(chainRegistrySet[origin], "ReactiveTest: origin not registered in chain registry");
+        return triggerFullCycle(origin, callData, chainRegistry[origin], maxIterations);
+    }
+
+    /// @notice Full-cycle with ETH value, using the chain registry for chain ID.
+    function triggerFullCycleWithValue(
+        address origin,
+        bytes memory callData,
+        uint256 value,
+        uint256 maxIterations
+    ) internal returns (CallbackResult[] memory results) {
+        require(chainRegistrySet[origin], "ReactiveTest: origin not registered in chain registry");
+        return triggerFullCycleWithValue(origin, callData, value, chainRegistry[origin], maxIterations);
     }
 
     // ---- Convenience: Cron ----
